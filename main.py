@@ -1,12 +1,33 @@
-from tinkoff.invest import Client
-from tinkoff.invest.schemas import InstrumentExchangeType, GetAssetFundamentalsRequest
+from time import sleep
+
 import pandas as pd
+from datetime import timedelta, datetime
+import pytz
+
+from tinkoff.invest import Client, CandleInterval
+from tinkoff.invest.schemas import InstrumentExchangeType, GetAssetFundamentalsRequest, InstrumentIdType, CandleSource
+from tinkoff.invest.utils import now
 
 from utils.auth import get_token
+from constants.time_columns import TIME_COLUMNS
+
+
+def utc_to_moscow(utc_datetime):
+    tz_moscow = pytz.timezone('Europe/Moscow')
+
+    utc_datetime = utc_datetime.replace(tzinfo=pytz.utc)
+    moscow_datetime = utc_datetime.astimezone(tz_moscow)
+    return moscow_datetime
 
 class BaseInvest:
     def __init__(self):
         self.token = get_token.get_token()
+
+    def df_to_exel(self, name, df):
+        df.to_excel(name)
+
+    def df_to_csv(self, name, df):
+        df.to_csv(name, index=None, header=True)
 
 class BondsInvest(BaseInvest):
     def __bond_dict_from_object(self, bond):
@@ -76,9 +97,6 @@ class BondsInvest(BaseInvest):
 
         return coupons_df
 
-    def df_to_exel(self, name, df):
-        df.to_excel(name)
-
 
 class AssetInvest(BaseInvest):
     def __asset_dict_from_object(self, asset):
@@ -112,19 +130,9 @@ class AssetInvest(BaseInvest):
         if assets is None:
             assets = []
 
-        # todo получать ид из акции (https://russianinvestments.github.io/investAPI/instruments/#share)
         with Client(self.token) as client:
-            assets_id = []
-
-            for asset in assets:
-                instruments = client.instruments.find_instrument(
-                    query=asset
-                )
-                print(instruments.instruments[0])
-                assets_id.append(instruments.instruments[0].uid)
-
             request = GetAssetFundamentalsRequest(
-                assets=assets_id,
+                assets=assets,
             )
 
             r = client.instruments.get_asset_fundamentals(request=request)
@@ -138,11 +146,168 @@ class AssetInvest(BaseInvest):
         return assets_df
 
 
+class SharesInvest(BaseInvest):
+    def get_shares(self):
+        with Client(self.token) as client:
+            instruments = client.instruments
+            shares = []
+
+            # цикл получает все акции, доступные для покупи и продажи, в рублях и торгуемые на основной moex бирже
+            for method in ["shares"]:
+                for item in getattr(instruments, method)().instruments:
+                    if item.currency == "rub" \
+                            and item.buy_available_flag == True \
+                            and item.sell_available_flag == True \
+                            and item.exchange == "MOEX_DEALER_WEEKEND":
+                        shares.append(
+                            {
+                                "name": item.name,
+                                "ticker": item.ticker,
+                                "class_code": item.class_code,
+                                "figi": item.figi,
+                                "uid": item.uid,
+                                "lot": item.lot,
+                                "sector": item.sector
+                            }
+                        )
+
+            return shares
+
+    def get_share_by_ticker(self, ticker):
+        shares = self.get_shares()
+
+        for share in shares:
+            if share["ticker"] == ticker:
+                return share
+
+        return None
+
+    """
+        instrument_id - figi
+        
+        CANDLE_INTERVAL_UNSPECIFIED = 0
+        CANDLE_INTERVAL_1_MIN = 1
+        CANDLE_INTERVAL_2_MIN = 6
+        CANDLE_INTERVAL_3_MIN = 7
+        CANDLE_INTERVAL_5_MIN = 2
+        CANDLE_INTERVAL_10_MIN = 8
+        CANDLE_INTERVAL_15_MIN = 3
+        CANDLE_INTERVAL_30_MIN = 9
+        CANDLE_INTERVAL_HOUR = 4
+        CANDLE_INTERVAL_2_HOUR = 10
+        CANDLE_INTERVAL_4_HOUR = 11
+        CANDLE_INTERVAL_DAY = 5
+        CANDLE_INTERVAL_WEEK = 12
+        CANDLE_INTERVAL_MONTH = 13
+    """
+    def get_candle_by_year(self, instrument_id, interval):
+        # ключ - дата, значение - массив свечей
+        candles = {}
+        with Client(self.token) as client:
+            for candle in client.get_all_candles(
+                instrument_id=instrument_id,
+                from_=datetime.now().replace(hour=0, minute=0, second=0, tzinfo=pytz.utc) - timedelta(days=365), # todo return 365, 3 for tests
+                interval=interval,
+                candle_source_type=CandleSource.CANDLE_SOURCE_UNSPECIFIED,
+            ):
+                # todo можно смотреть по закрытым
+                if candle.time.strftime("%A") not in ["Saturday", "Sunday"]:
+                    candle_full_time = utc_to_moscow(candle.time).strftime('%Y-%m-%d %H:%M:%S')
+                    [candle_date, candle_time] = candle_full_time.split(" ")
+
+                    if candle_date in candles.keys():
+                        candles[candle_date].append({
+                            "time": candle_time,
+                            "open": float(f"{candle.open.units}.{f'0{candle.open.nano // 10000000}' if len(str(candle.open.nano)) == 8 else candle.open.nano // 10000000}"),
+                            "high": float(f"{candle.high.units}.{f'0{candle.high.nano // 10000000}' if len(str(candle.high.nano)) == 8 else candle.high.nano // 10000000}"),
+                            "low": float(f"{candle.low.units}.{f'0{candle.low.nano // 10000000}' if len(str(candle.low.nano)) == 8 else candle.low.nano // 10000000}"),
+                            "close": float(f"{candle.close.units}.{f'0{candle.close.nano // 10000000}' if len(str(candle.close.nano)) == 8 else candle.close.nano // 10000000}")
+                        })
+                    else:
+                        candles[candle_date] = [{
+                            "time": candle_time,
+                            "open": float(f"{candle.open.units}.{f'0{candle.open.nano // 10000000}' if len(str(candle.open.nano)) == 8 else candle.open.nano // 10000000}"),
+                            "high": float(f"{candle.high.units}.{f'0{candle.high.nano // 10000000}' if len(str(candle.high.nano)) == 8 else candle.high.nano // 10000000}"),
+                            "low": float(f"{candle.low.units}.{f'0{candle.low.nano // 10000000}' if len(str(candle.low.nano)) == 8 else candle.low.nano // 10000000}"),
+                            "close": float(f"{candle.close.units}.{f'0{candle.close.nano // 10000000}' if len(str(candle.close.nano)) == 8 else candle.close.nano // 10000000}")
+                        }]
+
+        return candles
+
+    def get_assets(self):
+        assets_id = []
+        with Client(self.token) as client:
+            response = client.instruments.get_assets()
+            for asset in response.assets:
+                if asset.type == 4:
+                    flag = False
+                    for instrument in asset.instruments:
+                        if instrument.instrument_kind == 2:
+                            flag = True
+                            break
+
+                    if flag:
+                        assets_id.append(asset.uid)
+
+        return assets_id
+
 def main():
-    asset_client = AssetInvest()
+    shares_client = SharesInvest()
 
-    df = asset_client.get_asset_fundamentals(["Роснефть"])
+    """
+    "name", "ticker", "class_code", "figi", "uid", "lot", "sector"
+    """
+    shares = shares_client.get_shares() # возвращает 80 акций
+    print(shares[0])
 
-    print(df.head())
+    shares_and_candles = []
+
+    # todo куча циклов в цикле, обязательно придумать что-то более оптимальное
+    for share in shares:
+        """
+        "time", "open", "high", "low", "close"
+        """
+        candles = shares_client.get_candle_by_year(share["figi"], CandleInterval.CANDLE_INTERVAL_5_MIN)
+        print("candles getted")
+        # sleep(60)
+        for date in candles.keys():
+            candles_by_share = {
+                "figi": share["figi"],
+                "class_code": share["class_code"],
+                "name": share["name"],
+                "ticker": share["ticker"],
+                "lot": share["lot"],
+                "sector": share["sector"],
+                "date": date,
+            }
+
+            # перебираем все свечи за один день
+            for time_column in TIME_COLUMNS:
+                value = None
+
+                for candle in candles[date]:
+                    if candle["time"] == time_column:
+                        # Now get only close
+                        value = candle["close"]
+
+                candles_by_share[time_column] = value
+
+            shares_and_candles.append(candles_by_share)
+        break
+
+    shares_df = pd.DataFrame(shares_and_candles)
+    print(shares_df.head(15))
+    exit(0)
+    shares_client.df_to_csv("shares_test.csv", shares_df)
+
+    # assets = shares_client.get_assets()
+    #
+    # print(assets[0])
+
+    # asset_client = AssetInvest()
+    # assets = ["40d89385-a03a-4659-bf4e-d3ecba011782"]
+    #
+    # assets_df = asset_client.get_asset_fundamentals(assets[:100])
+    # print(assets_df.columns)
 
 main()
