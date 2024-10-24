@@ -3,14 +3,31 @@ from time import sleep
 import pandas as pd
 from datetime import timedelta, datetime
 import pytz
+import pickle
+import re
 
 from tinkoff.invest import Client, CandleInterval
 from tinkoff.invest.schemas import InstrumentExchangeType, GetAssetFundamentalsRequest, InstrumentIdType, CandleSource
 from tinkoff.invest.utils import now
 
+import telebot
+
 from utils.auth import get_token
 from constants.time_columns import TIME_COLUMNS
 
+PATH = "models/decision-tree-model_shares_10.pickle"
+
+def load_model(path):
+    with open(path, "rb") as fin:
+        tree_loaded = pickle.load(fin)
+
+    return tree_loaded
+
+
+def is_only_latin_letters(s):
+    pattern = r'^[a-zA-Z]+$'
+
+    return bool(re.match(pattern, s))
 
 def utc_to_moscow(utc_datetime):
     tz_moscow = pytz.timezone('Europe/Moscow')
@@ -21,7 +38,7 @@ def utc_to_moscow(utc_datetime):
 
 class BaseInvest:
     def __init__(self):
-        self.token = get_token.get_token()
+        self.token = get_token.get_tbank_token()
 
     def df_to_exel(self, name, df):
         df.to_excel(name)
@@ -200,13 +217,13 @@ class SharesInvest(BaseInvest):
         CANDLE_INTERVAL_WEEK = 12
         CANDLE_INTERVAL_MONTH = 13
     """
-    def get_candle_by_year(self, instrument_id, interval):
+    def get_candle_by_year(self, instrument_id, interval, days=1):
         # ключ - дата, значение - массив свечей
         candles = {}
         with Client(self.token) as client:
             for candle in client.get_all_candles(
                 instrument_id=instrument_id,
-                from_=datetime.now().replace(hour=0, minute=0, second=0, tzinfo=pytz.utc) - timedelta(days=365), # todo return 365, 3 for tests
+                from_=datetime.now().replace(hour=0, minute=0, second=0, tzinfo=pytz.utc) - timedelta(days=days), # todo return 365, 3 for tests
                 interval=interval,
                 candle_source_type=CandleSource.CANDLE_SOURCE_UNSPECIFIED,
             ):
@@ -251,54 +268,60 @@ class SharesInvest(BaseInvest):
 
         return assets_id
 
-def main():
+def test_api():
     shares_client = SharesInvest()
 
     """
     "name", "ticker", "class_code", "figi", "uid", "lot", "sector"
     """
-    shares = shares_client.get_shares() # возвращает 80 акций
-    print(shares[0])
+    # shares = shares_client.get_shares() # возвращает 80 акций
+    # print(shares[0])
+
+    share = shares_client.get_share_by_ticker("ROSN")
+
+    candles = shares_client.get_candle_by_year(share["figi"], CandleInterval.CANDLE_INTERVAL_5_MIN)
+
+    print(candles[list(candles.keys())[-1]])
 
     shares_and_candles = []
 
     # todo куча циклов в цикле, обязательно придумать что-то более оптимальное
-    for share in shares:
-        """
-        "time", "open", "high", "low", "close"
-        """
-        candles = shares_client.get_candle_by_year(share["figi"], CandleInterval.CANDLE_INTERVAL_5_MIN)
-        print("candles getted")
-        # sleep(60)
-        for date in candles.keys():
-            candles_by_share = {
-                "figi": share["figi"],
-                "class_code": share["class_code"],
-                "name": share["name"],
-                "ticker": share["ticker"],
-                "lot": share["lot"],
-                "sector": share["sector"],
-                "date": date,
-            }
-
-            # перебираем все свечи за один день
-            for time_column in TIME_COLUMNS:
-                value = None
-
-                for candle in candles[date]:
-                    if candle["time"] == time_column:
-                        # Now get only close
-                        value = candle["close"]
-
-                candles_by_share[time_column] = value
-
-            shares_and_candles.append(candles_by_share)
-        break
-
-    shares_df = pd.DataFrame(shares_and_candles)
-    print(shares_df.head(15))
-    exit(0)
-    shares_client.df_to_csv("shares_test.csv", shares_df)
+    # for share in shares:
+    #     """
+    #     "time", "open", "high", "low", "close"
+    #     """
+    #     candles = shares_client.get_candle_by_year(share["figi"], CandleInterval.CANDLE_INTERVAL_5_MIN)
+    #     print("candles getted")
+    #     # sleep(60)
+    #     for date in candles.keys():
+    #         candles_by_share = {
+    #             "figi": share["figi"],
+    #             "class_code": share["class_code"],
+    #             "name": share["name"],
+    #             "ticker": share["ticker"],
+    #             "lot": share["lot"],
+    #             "sector": share["sector"],
+    #             "date": date,
+    #         }
+    #
+    #         # перебираем все свечи за один день
+    #         for time_column in TIME_COLUMNS:
+    #             value = None
+    #
+    #             for candle in candles[date]:
+    #                 if candle["time"] == time_column:
+    #                     # Now get only close
+    #                     value = candle["close"]
+    #
+    #             candles_by_share[time_column] = value
+    #
+    #         shares_and_candles.append(candles_by_share)
+    #     break
+    #
+    # shares_df = pd.DataFrame(shares_and_candles)
+    # print(shares_df.head(15))
+    # exit(0)
+    # shares_client.df_to_csv("shares_test.csv", shares_df)
 
     # assets = shares_client.get_assets()
     #
@@ -310,4 +333,113 @@ def main():
     # assets_df = asset_client.get_asset_fundamentals(assets[:100])
     # print(assets_df.columns)
 
-main()
+
+bot = telebot.TeleBot(get_token.get_tg_token())
+
+def start_message(user_id):
+    text = """
+Привет! Это тестовый бот для работы с акциями и облигациями.
+
+Тут ты можешь получить предсказания по ценам акции на ближайший час
+
+Узнать информацию об облигациях
+
+Получить финансовую отчетность интересной тебе компании
+"""
+
+    bot.send_message(user_id, text)
+
+def unknown_message(user_id):
+    text = "Напиши /start или /help для получения полезной информации"
+
+    bot.send_message(user_id, text)
+
+def help_message(user_id):
+    text = "Когда-нибудь тут будет полезная информация"
+
+    bot.send_message(user_id, text)
+
+def share_message(user_id, input_ticker):
+    shares_client = None
+
+    try:
+        shares_client = SharesInvest()
+
+        start_text = "Получаем информацию об акции"
+
+        bot.send_message(user_id, start_text)
+    except Exception as e:
+        error_text = "Информация об акция сейчас не доступна. Попробуйте позже"
+        bot.send_message(user_id, error_text)
+        return
+
+    share = shares_client.get_share_by_ticker(input_ticker.upper())
+
+    if not share:
+        error_text = "Вы ввели неправильный тикер. Попробуйте еще раз!"
+        bot.send_message(user_id, error_text)
+        return
+
+    start_candles_text = "Получаем информацию о свечках"
+
+    bot.send_message(user_id, start_candles_text)
+
+    candles = shares_client.get_candle_by_year(share["figi"], CandleInterval.CANDLE_INTERVAL_5_MIN)
+
+    candles_last_date = candles[list(candles.keys())[-1]]
+
+    last_10_candles = candles_last_date[-10:]
+
+    candles_message = "Тикер имеет следующие свечки за последний час:"
+
+    x_predict = []
+
+    for candle in last_10_candles:
+        x_predict.append(candle['close'])
+        candles_message += f"\nВремя: {candle['time']} | Цена: {candle['close']} руб"
+
+    bot.send_message(user_id, candles_message)
+
+    start_predict_text = "Пытаюсь предсказать цены акций на следующие 4 часа..."
+    bot.send_message(user_id, start_predict_text)
+
+    model = None
+
+    try:
+        model = load_model(PATH)
+    except Exception as e:
+        print(e)
+        error_text = "Предсказание сейчас недоступно. Попробуйте позже"
+        bot.send_message(user_id, error_text)
+        return
+
+
+    predict_text = "Предположительно, акции дальше будут иметь следующую стоимость:"
+
+    for i in range(1, (4 * 12) + 1):
+        y = model.predict([x_predict])
+        symbol = '-' if y[0] < x_predict[-1] else '+'
+
+        predict_text += f"\n{'{:.2f}'.format(y[0])} руб -> {symbol}"
+
+        x_predict = x_predict[1:]
+        x_predict.append(y[0])
+
+    bot.send_message(user_id, predict_text)
+
+@bot.message_handler(content_types=['text'])
+def get_text_messages(message):
+    if message.text == '/start':
+        start_message(message.from_user.id)
+    elif message.text == '/help':
+        help_message(message.from_user.id)
+    elif is_only_latin_letters(message.text):
+        share_message(message.from_user.id, message.text)
+    else:
+        unknown_message(message.from_user.id)
+
+
+
+bot.polling(none_stop=True, interval=0)
+
+# test_api()
