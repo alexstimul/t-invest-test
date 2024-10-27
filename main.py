@@ -1,272 +1,25 @@
 from time import sleep
 
-import pandas as pd
-from datetime import timedelta, datetime
-import pytz
-import pickle
-import re
+from bs4 import BeautifulSoup as bs
+import requests
 
 from tinkoff.invest import Client, CandleInterval
-from tinkoff.invest.schemas import InstrumentExchangeType, GetAssetFundamentalsRequest, InstrumentIdType, CandleSource
-from tinkoff.invest.utils import now
 
 import telebot
+from telebot import types
 
 from utils.auth import get_token
+from utils import utils
 from constants.time_columns import TIME_COLUMNS
+
+from classes.SharesInvest import SharesInvest
 
 PATH = "models/decision-tree-model_shares_10.pickle"
 
-def load_model(path):
-    with open(path, "rb") as fin:
-        tree_loaded = pickle.load(fin)
+REQUEST_HEADER = header = {'accept': '*/*',
+          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                        '(HTML, like Gecko) Chrome/73.0.3683.103 Safari/537.36'}
 
-    return tree_loaded
-
-
-def is_only_latin_letters(s):
-    pattern = r'^[a-zA-Z]+$'
-
-    return bool(re.match(pattern, s))
-
-def utc_to_moscow(utc_datetime):
-    tz_moscow = pytz.timezone('Europe/Moscow')
-
-    utc_datetime = utc_datetime.replace(tzinfo=pytz.utc)
-    moscow_datetime = utc_datetime.astimezone(tz_moscow)
-    return moscow_datetime
-
-class BaseInvest:
-    def __init__(self):
-        self.token = get_token.get_tbank_token()
-
-    def df_to_exel(self, name, df):
-        df.to_excel(name)
-
-    def df_to_csv(self, name, df):
-        df.to_csv(name, index=None, header=True)
-
-class BondsInvest(BaseInvest):
-    def __bond_dict_from_object(self, bond):
-        return {
-            "figi": bond.figi,
-            "ticker": bond.ticker,
-            "name": bond.name,
-            # Tорговая площадка (секция биржи).
-            "exchange": bond.exchange,
-            # Количество выплат по купонам в год.
-            "coupon_quantity_per_year": bond.coupon_quantity_per_year,
-            # Дата погашения облигации по UTC.
-            "maturity_date": bond.maturity_date.date(),
-            # Первоначальный номинал облигации.
-            "initial_nominal": bond.initial_nominal.units,
-            "initial_nominal_curr": bond.initial_nominal.currency,
-            # Номинал облигации.
-            "nominal": bond.nominal.units,
-            "nominal_curr": bond.nominal.currency,
-            # Наименование страны риска — то есть страны, в которой компания ведёт основной бизнес.
-            "country_of_risk_name": bond.country_of_risk_name,
-            # Сектор экономики.
-            "sector": bond.sector,
-            # Признак облигации с плавающим купоном.
-            "floating_coupon_flag": bond.floating_coupon_flag
-        }
-
-    def __coupon_dict_from_object(self, coupon):
-        return {
-            "coupon_date": coupon.coupon_date.date(),
-            # todo складывать копейки (лежат в поле nano. Округлять до 2-х запятых)
-            "pay_one_bond": coupon.pay_one_bond.units,
-            "pay_one_bond_curr": coupon.pay_one_bond.currency,
-            "coupon_type": coupon.coupon_type
-        }
-
-    def get_bonds(self, max_date = None):
-        bonds_list = []
-
-        with Client(self.token) as client:
-            r = client.instruments.bonds(
-                instrument_exchange=InstrumentExchangeType.INSTRUMENT_EXCHANGE_UNSPECIFIED
-            )
-
-            for bond in r.instruments:
-                if bond.currency == "rub":
-                    if not max_date:
-                        bonds_list.append(self.__bond_dict_from_object(bond))
-                    elif bond.maturity_date < max_date:
-                        bonds_list.append(self.__bond_dict_from_object(bond))
-
-        bonds_df = pd.DataFrame(bonds_list)
-        bonds_df.set_index("ticker")
-
-        return bonds_df
-
-    def get_coupons_by_figi(self, figi):
-        coupons_list = []
-
-        with Client(self.token) as client:
-            coupons = client.instruments.get_bond_coupons(figi=figi)
-
-            for coupon in coupons.events:
-                coupons_list.append(self.__coupon_dict_from_object(coupon))
-
-        coupons_df = pd.DataFrame(coupons_list)
-
-        return coupons_df
-
-
-class AssetInvest(BaseInvest):
-    def __asset_dict_from_object(self, asset):
-        return {
-            "id": asset.asset_uid,
-            # Рыночная капитализация.
-            "market_capitalization": asset.market_capitalization,
-            # Процент форвардной дивидендной доходности по отношению к цене акций.
-            "forward_annual_dividend_yield": asset.forward_annual_dividend_yield,
-            # Среднегодовой рocт выручки за 3 года.
-            "three_year_annual_revenue_growth_rate": asset.three_year_annual_revenue_growth_rate,
-            # Среднегодовой рocт выручки за 5 лет.
-            "five_year_annual_revenue_growth_rate": asset.five_year_annual_revenue_growth_rate,
-            # Дивидендная доходность за 12 месяцев.
-            "dividend_yield_daily_ttm": asset.dividend_yield_daily_ttm,
-            # Выплаченные дивиденды за 12 месяцев.
-            "dividend_rate_ttm": asset.dividend_rate_ttm,
-            # Средняя дивидендная доходность за 5 лет.
-            "five_years_average_dividend_yield": asset.five_years_average_dividend_yield,
-            # Среднегодовой рост дивидендов за 5 лет.
-            "five_year_annual_dividend_growth_rate": asset.five_year_annual_dividend_growth_rate,
-            # Рост выручки за 1 год.
-            "one_year_annual_revenue_growth_rate": asset.one_year_annual_revenue_growth_rate,
-            # Изменение общего дохода за 5 лет.
-            "revenue_change_five_years": asset.revenue_change_five_years
-        }
-
-    def get_asset_fundamentals(self, assets=None):
-        assets_list = []
-
-        if assets is None:
-            assets = []
-
-        with Client(self.token) as client:
-            request = GetAssetFundamentalsRequest(
-                assets=assets,
-            )
-
-            r = client.instruments.get_asset_fundamentals(request=request)
-
-            for asset in r.fundamentals:
-                assets_list.append(self.__asset_dict_from_object(asset))
-
-        assets_df = pd.DataFrame(assets_list)
-        assets_df.set_index("id")
-
-        return assets_df
-
-
-class SharesInvest(BaseInvest):
-    def get_shares(self):
-        with Client(self.token) as client:
-            instruments = client.instruments
-            shares = []
-
-            # цикл получает все акции, доступные для покупи и продажи, в рублях и торгуемые на основной moex бирже
-            for method in ["shares"]:
-                for item in getattr(instruments, method)().instruments:
-                    if item.currency == "rub" \
-                            and item.buy_available_flag == True \
-                            and item.sell_available_flag == True \
-                            and item.exchange == "MOEX_DEALER_WEEKEND":
-                        shares.append(
-                            {
-                                "name": item.name,
-                                "ticker": item.ticker,
-                                "class_code": item.class_code,
-                                "figi": item.figi,
-                                "uid": item.uid,
-                                "lot": item.lot,
-                                "sector": item.sector
-                            }
-                        )
-
-            return shares
-
-    def get_share_by_ticker(self, ticker):
-        shares = self.get_shares()
-
-        for share in shares:
-            if share["ticker"] == ticker:
-                return share
-
-        return None
-
-    """
-        instrument_id - figi
-        
-        CANDLE_INTERVAL_UNSPECIFIED = 0
-        CANDLE_INTERVAL_1_MIN = 1
-        CANDLE_INTERVAL_2_MIN = 6
-        CANDLE_INTERVAL_3_MIN = 7
-        CANDLE_INTERVAL_5_MIN = 2
-        CANDLE_INTERVAL_10_MIN = 8
-        CANDLE_INTERVAL_15_MIN = 3
-        CANDLE_INTERVAL_30_MIN = 9
-        CANDLE_INTERVAL_HOUR = 4
-        CANDLE_INTERVAL_2_HOUR = 10
-        CANDLE_INTERVAL_4_HOUR = 11
-        CANDLE_INTERVAL_DAY = 5
-        CANDLE_INTERVAL_WEEK = 12
-        CANDLE_INTERVAL_MONTH = 13
-    """
-    def get_candle_by_year(self, instrument_id, interval, days=1):
-        # ключ - дата, значение - массив свечей
-        candles = {}
-        with Client(self.token) as client:
-            for candle in client.get_all_candles(
-                instrument_id=instrument_id,
-                from_=datetime.now().replace(hour=0, minute=0, second=0, tzinfo=pytz.utc) - timedelta(days=days), # todo return 365, 3 for tests
-                interval=interval,
-                candle_source_type=CandleSource.CANDLE_SOURCE_UNSPECIFIED,
-            ):
-                # todo можно смотреть по закрытым
-                if candle.time.strftime("%A") not in ["Saturday", "Sunday"]:
-                    candle_full_time = utc_to_moscow(candle.time).strftime('%Y-%m-%d %H:%M:%S')
-                    [candle_date, candle_time] = candle_full_time.split(" ")
-
-                    if candle_date in candles.keys():
-                        candles[candle_date].append({
-                            "time": candle_time,
-                            "open": float(f"{candle.open.units}.{f'0{candle.open.nano // 10000000}' if len(str(candle.open.nano)) == 8 else candle.open.nano // 10000000}"),
-                            "high": float(f"{candle.high.units}.{f'0{candle.high.nano // 10000000}' if len(str(candle.high.nano)) == 8 else candle.high.nano // 10000000}"),
-                            "low": float(f"{candle.low.units}.{f'0{candle.low.nano // 10000000}' if len(str(candle.low.nano)) == 8 else candle.low.nano // 10000000}"),
-                            "close": float(f"{candle.close.units}.{f'0{candle.close.nano // 10000000}' if len(str(candle.close.nano)) == 8 else candle.close.nano // 10000000}")
-                        })
-                    else:
-                        candles[candle_date] = [{
-                            "time": candle_time,
-                            "open": float(f"{candle.open.units}.{f'0{candle.open.nano // 10000000}' if len(str(candle.open.nano)) == 8 else candle.open.nano // 10000000}"),
-                            "high": float(f"{candle.high.units}.{f'0{candle.high.nano // 10000000}' if len(str(candle.high.nano)) == 8 else candle.high.nano // 10000000}"),
-                            "low": float(f"{candle.low.units}.{f'0{candle.low.nano // 10000000}' if len(str(candle.low.nano)) == 8 else candle.low.nano // 10000000}"),
-                            "close": float(f"{candle.close.units}.{f'0{candle.close.nano // 10000000}' if len(str(candle.close.nano)) == 8 else candle.close.nano // 10000000}")
-                        }]
-
-        return candles
-
-    def get_assets(self):
-        assets_id = []
-        with Client(self.token) as client:
-            response = client.instruments.get_assets()
-            for asset in response.assets:
-                if asset.type == 4:
-                    flag = False
-                    for instrument in asset.instruments:
-                        if instrument.instrument_kind == 2:
-                            flag = True
-                            break
-
-                    if flag:
-                        assets_id.append(asset.uid)
-
-        return assets_id
 
 def test_api():
     shares_client = SharesInvest()
@@ -347,7 +100,15 @@ def start_message(user_id):
 Получить финансовую отчетность интересной тебе компании
 """
 
-    bot.send_message(user_id, text)
+    button_get_category_a = types.InlineKeyboardButton('Получить акции категории А', callback_data=f'get_company_A')
+    button_get_category_b = types.InlineKeyboardButton('Получить акции категории Б', callback_data=f'get_company_B')
+    button_get_category_ab = types.InlineKeyboardButton('Получить акции категории А и Б', callback_data=f'get_company_AB')
+
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(button_get_category_a)
+    keyboard.add(button_get_category_b)
+    keyboard.add(button_get_category_ab)
+    bot.send_message(user_id, text, reply_markup=keyboard)
 
 def unknown_message(user_id):
     text = "Напиши /start или /help для получения полезной информации"
@@ -384,7 +145,7 @@ def share_message(user_id, input_ticker):
 
     bot.send_message(user_id, start_candles_text)
 
-    candles = shares_client.get_candle_by_year(share["figi"], CandleInterval.CANDLE_INTERVAL_5_MIN)
+    candles = shares_client.get_candle_by_year(share["figi"], CandleInterval.CANDLE_INTERVAL_5_MIN, 5)
 
     candles_last_date = candles[list(candles.keys())[-1]]
 
@@ -392,13 +153,349 @@ def share_message(user_id, input_ticker):
 
     candles_message = "Тикер имеет следующие свечки за последний час:"
 
+    for candle in last_10_candles:
+        candles_message += f"\nВремя: {candle['time']} | Цена: {candle['close']} руб"
+
+    button_get_predict = types.InlineKeyboardButton('Получить предсказание', callback_data=f'get_predict_{input_ticker}')
+    button_get_fin = types.InlineKeyboardButton('Получить финансовый отчет за 5 лет', callback_data=f'get_fin_{input_ticker}')
+
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(button_get_predict)
+    keyboard.add(button_get_fin)
+    bot.send_message(user_id, candles_message, reply_markup=keyboard)
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_worker(call):
+    if "get_predict_" in call.data:
+        ticker = call.data.split("_")[-1]
+        share_predict(ticker, call.message.chat.id)
+    elif "get_fin_" in call.data:
+        ticker = call.data.split("_")[-1]
+        share_get_fin(ticker, call.message.chat.id)
+    elif "get_company_A" in call.data:
+        get_companies_a(call.message.chat.id)
+    elif "get_company_B" in call.data:
+        get_companies_b(call.message.chat.id)
+    elif "get_company_AB" in call.data:
+        pass
+
+def get_companies_a(user_id):
+    start_text = "Получение списка компаний класса А.\n\nПодождите, это займет несколько минут..."
+    bot.send_message(user_id, start_text)
+
+    url = 'https://smart-lab.ru/q/__TICKER__/f/y/'
+
+    shares_client = SharesInvest()
+
+    shares = shares_client.get_shares()
+
+    shares_financials = []
+
+    for share in shares:
+        print(share["ticker"])
+        request = requests.get(url.replace("__TICKER__", share["ticker"]), headers=REQUEST_HEADER)
+
+        if request.status_code == 200:
+            share_obj = { "name": share["name"], "ticker": share["ticker"], "net_income": [], "book_value": [], "debt": [], "roe": [] }
+
+            soup = bs(request.content, 'html.parser')
+            table = soup.find_all('table', {'class': 'simple-little-table financials'})
+
+            if not table or len(table) < 1:
+                continue
+
+            rows = table[0].find_all('tr')
+
+            for tr in rows:
+                field = tr.get("field")
+
+                if field == "net_income": # чистая прибыль
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["net_income"]) < 5:
+                            value = float(td.text.replace(" ", ""))
+                            share_obj["net_income"].append(value)
+                elif field == "book_value": # собственный капитал = балансная стоимость
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["book_value"]) < 5:
+                            value = float(td.text.replace(" ", ""))
+                            share_obj["book_value"].append(value)
+                elif field == "roe":
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and "%" in td.text and len(share_obj["roe"]) <= 5:
+                            share_obj["roe"].append(float(td.text.replace(" ", "").split("%")[0]))
+                elif field == "debt": # долгосрочный долг
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["debt"]) < 5:
+                            value = float(td.text.replace(" ", ""))
+                            share_obj["debt"].append(value)
+
+            if len(share_obj["book_value"]) == 5 and len(share_obj["net_income"]) == 5:
+                shares_financials.append(share_obj)
+
+        sleep(2)
+
+    print("All A:", len(shares_financials))
+
+    shares_a = []
+
+    for share_fin in shares_financials:
+        last_net_income = share_fin["net_income"][-1]
+        first_net_income = share_fin["net_income"][0]
+
+        last_book_value = share_fin["book_value"][-1]
+        first_book_value = share_fin["book_value"][0]
+
+        if first_net_income > 0 and last_net_income > 0 and first_book_value > 0 and last_book_value > 0:
+            net_income_up = (((last_net_income / first_net_income) ** (1 / 4)) - 1) * 100
+            book_value_up = (((last_book_value / first_book_value) ** (1 / 4)) - 1) * 100
+            mean_roe = sum(share_fin["roe"]) / len(share_fin["roe"])
+
+            if net_income_up > 15 and book_value_up > 10 and mean_roe >= 15:
+                shares_a.append({
+                    "name": share_fin["name"],
+                    "ticker": share_fin["ticker"],
+                    "mean_income": net_income_up,
+                    "mead_book_value": book_value_up,
+                    "mean_roe": mean_roe
+                })
+
+    result_text = "Акции класса А:"
+
+    for share_a in shares_a:
+        result_text += f'\n\nИмя: {share_a["name"]}'
+        result_text += f'\nТикер: {share_a["ticker"]}'
+        result_text += f'\nРост прибыли: {"{:.2f}".format(share_a["mean_income"])}%'
+        result_text += f'\nРост собственного капитала: {"{:.2f}".format(share_a["mead_book_value"])}%'
+        result_text += f'\nСредняя рентабельность капитала: {"{:.2f}".format(share_a["mean_roe"])}%'
+
+    result_text += "\n\n *Пока не учитывается долг компаний. В ближайшем обновлении будет"
+
+    bot.send_message(user_id, result_text)
+
+# todo запоминание данных
+def get_companies_b(user_id):
+    start_text = "Получение списка компаний класса Б.\n\nПодождите, это займет несколько минут..."
+    bot.send_message(user_id, start_text)
+
+    url = 'https://smart-lab.ru/q/__TICKER__/f/y/'
+
+    shares_client = SharesInvest()
+
+    shares = shares_client.get_shares()
+
+    shares_financials = []
+
+    for share in shares:
+        print(share["ticker"])
+        request = requests.get(url.replace("__TICKER__", share["ticker"]), headers=REQUEST_HEADER)
+
+        if request.status_code == 200:
+            share_obj = { "name": share["name"], "ticker": share["ticker"], "net_income": [], "book_value": [], "debt": [], "roe": [] }
+
+            soup = bs(request.content, 'html.parser')
+            table = soup.find_all('table', {'class': 'simple-little-table financials'})
+
+            if not table or len(table) < 1:
+                continue
+
+            rows = table[0].find_all('tr')
+
+            for tr in rows:
+                field = tr.get("field")
+
+                if field == "net_income": # чистая прибыль
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["net_income"]) < 5:
+                            value = float(td.text.replace(" ", ""))
+                            share_obj["net_income"].append(value)
+                elif field == "book_value": # собственный капитал = балансная стоимость
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["book_value"]) < 5:
+                            value = float(td.text.replace(" ", ""))
+                            share_obj["book_value"].append(value)
+                elif field == "roe":
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and "%" in td.text and len(share_obj["roe"]) <= 5:
+                            share_obj["roe"].append(float(td.text.replace(" ", "").split("%")[0]))
+                elif field == "debt": # долгосрочный долг
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["debt"]) < 5:
+                            value = float(td.text.replace(" ", ""))
+                            share_obj["debt"].append(value)
+
+            if len(share_obj["book_value"]) == 5 and len(share_obj["net_income"]) == 5:
+                shares_financials.append(share_obj)
+
+        sleep(2)
+
+    print("All B:", len(shares_financials))
+
+    shares_a = []
+
+    for share_fin in shares_financials:
+        last_net_income = share_fin["net_income"][-1]
+        first_net_income = share_fin["net_income"][0]
+
+        last_book_value = share_fin["book_value"][-1]
+        first_book_value = share_fin["book_value"][0]
+
+        # todo убрать условие, оберунть вычисления в try except
+        if first_net_income > 0 and last_net_income > 0 and first_book_value > 0 and last_book_value > 0:
+            net_income_up = (((last_net_income / first_net_income) ** (1 / 4)) - 1) * 100
+            book_value_up = (((last_book_value / first_book_value) ** (1 / 4)) - 1) * 100
+            mean_roe = sum(share_fin["roe"]) / len(share_fin["roe"])
+
+            if (0 <= net_income_up <= 20) and book_value_up <= 15 and mean_roe <= 15: # todo границы увеличины на 5, чтоб попадали пограничные акции
+                shares_a.append({
+                    "name": share_fin["name"],
+                    "ticker": share_fin["ticker"],
+                    "mean_income": net_income_up,
+                    "mead_book_value": book_value_up,
+                    "mean_roe": mean_roe
+                })
+
+    result_text = "Акции класса Б:"
+
+    for share_a in shares_a:
+        result_text += f'\n\nИмя: {share_a["name"]}'
+        result_text += f'\nТикер: {share_a["ticker"]}'
+        result_text += f'\nРост прибыли: {"{:.2f}".format(share_a["mean_income"])}%'
+        result_text += f'\nРост собственного капитала: {"{:.2f}".format(share_a["mead_book_value"])}%'
+        result_text += f'\nСредняя рентабельность капитала: {"{:.2f}".format(share_a["mean_roe"])}%'
+
+    result_text += "\n\n *Пока не учитывается долг компаний. В ближайшем обновлении будет"
+
+    bot.send_message(user_id, result_text)
+
+def share_get_fin(ticker, user_id):
+    start_text = "Получение списка компаний класса Б.\n\nПодождите, это займет несколько минут..."
+    bot.send_message(user_id, start_text)
+
+    url = 'https://smart-lab.ru/q/__TICKER__/f/y/'
+
+    shares_client = SharesInvest()
+
+    shares = [shares_client.get_share_by_ticker(ticker.upper())]
+
+    shares_financials = []
+
+    for share in shares:
+        print(share["ticker"])
+        request = requests.get(url.replace("__TICKER__", share["ticker"]), headers=REQUEST_HEADER)
+
+        if request.status_code == 200:
+            share_obj = {"name": share["name"], "ticker": share["ticker"], "net_income": [], "book_value": [],
+                         "debt": [], "roe": []}
+
+            soup = bs(request.content, 'html.parser')
+            table = soup.find_all('table', {'class': 'simple-little-table financials'})
+
+            if not table or len(table) < 1:
+                continue
+
+            rows = table[0].find_all('tr')
+
+            for tr in rows:
+                field = tr.get("field")
+
+                if field == "net_income":  # чистая прибыль
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["net_income"]) < 5:
+                            value = float(td.text.replace(" ", ""))
+                            share_obj["net_income"].append(value)
+                elif field == "book_value":  # собственный капитал = балансная стоимость
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["book_value"]) < 5:
+                            value = float(td.text.replace(" ", ""))
+                            share_obj["book_value"].append(value)
+                elif field == "roe":
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and "%" in td.text and len(share_obj["roe"]) <= 5:
+                            share_obj["roe"].append(float(td.text.replace(" ", "").split("%")[0]))
+                elif field == "debt":  # долгосрочный долг
+                    tds = tr.find_all('td')
+                    for td in tds:
+                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["debt"]) < 5:
+                            value = float(td.text.replace(" ", ""))
+                            share_obj["debt"].append(value)
+
+            shares_financials.append(share_obj)
+
+    shares_a = []
+
+    for share_fin in shares_financials:
+        last_net_income = share_fin["net_income"][-1]
+        first_net_income = share_fin["net_income"][0]
+
+        last_book_value = share_fin["book_value"][-1]
+        first_book_value = share_fin["book_value"][0]
+
+        # todo убрать условие, оберунть вычисления в try except
+        if first_net_income > 0 and last_net_income > 0 and first_book_value > 0 and last_book_value > 0:
+            net_income_up = (((last_net_income / first_net_income) ** (1 / 4)) - 1) * 100
+            book_value_up = (((last_book_value / first_book_value) ** (1 / 4)) - 1) * 100
+            mean_roe = sum(share_fin["roe"]) / len(share_fin["roe"])
+
+            shares_a.append({
+                "name": share_fin["name"],
+                "ticker": share_fin["ticker"],
+                "mean_income": net_income_up,
+                "mead_book_value": book_value_up,
+                "mean_roe": mean_roe
+            })
+
+
+    result_text = ""
+
+    for share_a in shares_a:
+        result_text += f'Имя: {share_a["name"]}'
+        result_text += f'\nТикер: {share_a["ticker"]}'
+        result_text += f'\nРост прибыли: {"{:.2f}".format(share_a["mean_income"])}%'
+        result_text += f'\nРост собственного капитала: {"{:.2f}".format(share_a["mead_book_value"])}%'
+        result_text += f'\nСредняя рентабельность капитала: {"{:.2f}".format(share_a["mean_roe"])}%'
+
+    result_text += "\n\n *Пока не учитывается долг компаний. В ближайшем обновлении будет"
+
+    bot.send_message(user_id, result_text)
+
+def share_predict(input_ticker, user_id):
+    shares_client = None
+
+    try:
+        shares_client = SharesInvest()
+    except Exception as e:
+        error_text = "Предсказание сейчас недоступно. Попробуйте позже"
+        bot.send_message(user_id, error_text)
+        return
+
+    share = shares_client.get_share_by_ticker(input_ticker.upper())
+
+    if not share:
+        error_text = "Вы ввели неправильный тикер. Попробуйте еще раз!"
+        bot.send_message(user_id, error_text)
+        return
+
+    candles = shares_client.get_candle_by_year(share["figi"], CandleInterval.CANDLE_INTERVAL_5_MIN, 5)
+
+    candles_last_date = candles[list(candles.keys())[-1]]
+
+    last_10_candles = candles_last_date[-10:]
+
     x_predict = []
 
     for candle in last_10_candles:
         x_predict.append(candle['close'])
-        candles_message += f"\nВремя: {candle['time']} | Цена: {candle['close']} руб"
-
-    bot.send_message(user_id, candles_message)
 
     start_predict_text = "Пытаюсь предсказать цены акций на следующие 4 часа..."
     bot.send_message(user_id, start_predict_text)
@@ -406,13 +503,11 @@ def share_message(user_id, input_ticker):
     model = None
 
     try:
-        model = load_model(PATH)
+        model = utils.load_model(PATH)
     except Exception as e:
-        print(e)
         error_text = "Предсказание сейчас недоступно. Попробуйте позже"
         bot.send_message(user_id, error_text)
         return
-
 
     predict_text = "Предположительно, акции дальше будут иметь следующую стоимость:"
 
@@ -433,7 +528,7 @@ def get_text_messages(message):
         start_message(message.from_user.id)
     elif message.text == '/help':
         help_message(message.from_user.id)
-    elif is_only_latin_letters(message.text):
+    elif utils.is_only_latin_letters(message.text):
         share_message(message.from_user.id, message.text)
     else:
         unknown_message(message.from_user.id)
@@ -441,5 +536,3 @@ def get_text_messages(message):
 
 
 bot.polling(none_stop=True, interval=0)
-
-# test_api()
