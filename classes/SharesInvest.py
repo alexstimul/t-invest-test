@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+import re
+
 import pytz
 import requests
 from bs4 import BeautifulSoup as bs
@@ -32,8 +34,43 @@ class SharesInvest(BaseInvest):
             print(f'Error when get smart lab data. {e}')
             return None
 
+    def __get_dohod_data_content(self, ticker):
+        try:
+            request = requests.get(fin.DOHOD_URL.replace(fin.TICKER_PATTERN, ticker), headers=fin.SMART_LAB_REQUEST_HEADER)
+
+            if request.status_code == 200 and request.content:
+                return request.content
+
+            return None
+        except Exception as e:
+            print(f'Error when get smart lab data. {e}')
+            return None
+
+    def __parse_div_response(self, content, share_name, ticker):
+        share_obj = {"name": share_name, "ticker": ticker, "few_divs": ''}
+
+        soup = bs(content, 'html.parser')
+        main_div = soup.find_all('div', {'id': 'leftside-col'})
+
+        if not main_div or len(main_div) < 1:
+            return None
+
+        paragraphs = main_div[0].find_all('p')
+
+        share_obj['few_divs'] = ' '.join(paragraphs[0].text.split())
+
+        return share_obj
+
+    def get_divs_by_share(self, ticker):
+        share = self.get_share_by_ticker(ticker.upper())
+
+        content = self.__get_dohod_data_content(ticker)
+        share_divs = self.__parse_div_response(content, share["name"], share["ticker"])
+
+        return share_divs['few_divs']
+
     def __parse_fin_response_for_classification(self, content, share_name, ticker):
-        share_obj = {"name": share_name, "ticker": ticker, "net_income": [], "book_value": [], "debt": [], "roe": []}
+        share_obj = {"name": share_name, "ticker": ticker, "net_income": [], "book_value": [], "debt": [], "roe": [], "eps": [], "p_e": [], "p_bv": []}
 
         soup = bs(content, 'html.parser')
         table = soup.find_all('table', {'class': 'simple-little-table financials'})
@@ -69,6 +106,25 @@ class SharesInvest(BaseInvest):
                     if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj[fin.DEBT]) < 5:
                         value = float(td.text.replace(" ", ""))
                         share_obj[fin.DEBT].append(value)
+
+            elif field == fin.EPS:  # собственный капитал = балансная стоимость
+                tds = tr.find_all('td')
+                for td in tds:
+                    if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj[fin.EPS]) < 5:
+                        value = float(td.text.replace(" ", ""))
+                        share_obj[fin.EPS].append(value)
+            elif field == fin.P_E:  # собственный капитал = балансная стоимость
+                tds = tr.find_all('td')
+                for td in tds:
+                    if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj[fin.P_E]) < 5:
+                        value = float(td.text.replace(" ", ""))
+                        share_obj[fin.P_E].append(value)
+            elif field == fin.P_BV:  # собственный капитал = балансная стоимость
+                tds = tr.find_all('td')
+                for td in tds:
+                    if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj[fin.P_BV]) < 5:
+                        value = float(td.text.replace(" ", ""))
+                        share_obj[fin.P_BV].append(value)
 
         return share_obj
 
@@ -141,6 +197,22 @@ class SharesInvest(BaseInvest):
 
         return shares_class_b
 
+    def get_share_financials(self, ticker):
+        for share_fin in self.shares_financials:
+            if ticker == share_fin["ticker"]:
+                profit, capital, roe = self.__calculate_growth_indicators_by_share(share_fin)
+
+                if (not profit is None) and (not capital is None) and (not roe is None):
+                    return {
+                        "name": share_fin["name"],
+                        "ticker": share_fin["ticker"],
+                        "profit": profit,
+                        "capital": capital,
+                        "mean_roe": roe
+                    }
+
+        return None
+
     def get_share_fin_classification_text(self, shares, class_type = "А"):
         result_text = f'Акции класса {class_type}:'
 
@@ -154,6 +226,68 @@ class SharesInvest(BaseInvest):
         result_text += "\n\n *Пока не учитывается долг компаний. В ближайшем обновлении будет"
 
         return result_text
+
+    def __get_eps_growth(self, share_fin):
+        last_eps = share_fin[fin.EPS][-1]
+        first_eps = share_fin[fin.EPS][0]
+
+        return (((last_eps / first_eps) ** (1/4)) - 1) * 100
+
+    def __get_conservative_percent_growth(self, growth):
+        if growth > 20:
+            return 1.2
+        elif 15 < growth <= 20:
+            return 1.15
+        elif 10 <= growth <= 15:
+            return 1.1
+        else:
+            return 0
+
+    def __avg_p_e(self, share_fin):
+        sum_pe = sum(share_fin[fin.P_E])
+        count_pe = len(share_fin[fin.P_E])
+
+        isAnomaly = False
+        anomalyIndex = -1
+
+        for i in range(len(share_fin[fin.P_E])):
+            isAnomaly = True
+            anomalyIndex = i
+            for j in range(len(share_fin[fin.P_E])):
+                if i != j:
+                    delta = abs(share_fin[fin.P_E][i] / share_fin[fin.P_E][j])
+                    if 0.1 <= delta <= 10:
+                        isAnomaly = False
+
+            if isAnomaly:
+                break
+
+        if isAnomaly:
+            sum_pe -= share_fin[fin.P_E][anomalyIndex]
+            count_pe -= 1
+
+        return sum_pe / count_pe
+
+    def get_potential_share_price(self, ticker):
+        print(ticker)
+        print(len(self.shares_financials))
+        for share_fin in self.shares_financials:
+            if ticker == share_fin["ticker"]:
+                print(share_fin)
+            if ticker == share_fin["ticker"] and len(share_fin[fin.EPS]) == 5 and len(share_fin[fin.P_E]) == 5:
+                growth = self.__get_eps_growth(share_fin)
+                conservative_rate = self.__get_conservative_percent_growth(growth)
+                avg_pe = self.__avg_p_e(share_fin)
+                last_eps = share_fin[fin.EPS][-1]
+
+                print(growth, conservative_rate, avg_pe, last_eps)
+
+                return (last_eps * (conservative_rate ** 4)) * avg_pe
+
+        return None
+
+    def get_reasonable_share_price(self, potential_price, rate):
+        return potential_price / (rate ** 4)
 
     def get_shares(self):
         with Client(self.token) as client:
