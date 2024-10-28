@@ -88,6 +88,7 @@ def test_api():
 
 
 bot = telebot.TeleBot(get_token.get_tg_token())
+shares_client = SharesInvest()
 
 def start_message(user_id):
     text = """
@@ -180,101 +181,14 @@ def callback_worker(call):
         pass
 
 def get_companies_a(user_id):
-    start_text = "Получение списка компаний класса А.\n\nПодождите, это займет несколько минут..."
+    class_type = 'А'
+    start_text = f'Получение списка компаний класса {class_type}.'
     bot.send_message(user_id, start_text)
 
-    url = 'https://smart-lab.ru/q/__TICKER__/f/y/'
+    shares_class_a = shares_client.get_shares_by_class_a()
+    text = shares_client.get_share_fin_classification_text(shares_class_a, class_type)
 
-    shares_client = SharesInvest()
-
-    shares = shares_client.get_shares()
-
-    shares_financials = []
-
-    for share in shares:
-        print(share["ticker"])
-        request = requests.get(url.replace("__TICKER__", share["ticker"]), headers=REQUEST_HEADER)
-
-        if request.status_code == 200:
-            share_obj = { "name": share["name"], "ticker": share["ticker"], "net_income": [], "book_value": [], "debt": [], "roe": [] }
-
-            soup = bs(request.content, 'html.parser')
-            table = soup.find_all('table', {'class': 'simple-little-table financials'})
-
-            if not table or len(table) < 1:
-                continue
-
-            rows = table[0].find_all('tr')
-
-            for tr in rows:
-                field = tr.get("field")
-
-                if field == "net_income": # чистая прибыль
-                    tds = tr.find_all('td')
-                    for td in tds:
-                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["net_income"]) < 5:
-                            value = float(td.text.replace(" ", ""))
-                            share_obj["net_income"].append(value)
-                elif field == "book_value": # собственный капитал = балансная стоимость
-                    tds = tr.find_all('td')
-                    for td in tds:
-                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["book_value"]) < 5:
-                            value = float(td.text.replace(" ", ""))
-                            share_obj["book_value"].append(value)
-                elif field == "roe":
-                    tds = tr.find_all('td')
-                    for td in tds:
-                        if td.text and "%" in td.text and len(share_obj["roe"]) <= 5:
-                            share_obj["roe"].append(float(td.text.replace(" ", "").split("%")[0]))
-                elif field == "debt": # долгосрочный долг
-                    tds = tr.find_all('td')
-                    for td in tds:
-                        if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj["debt"]) < 5:
-                            value = float(td.text.replace(" ", ""))
-                            share_obj["debt"].append(value)
-
-            if len(share_obj["book_value"]) == 5 and len(share_obj["net_income"]) == 5:
-                shares_financials.append(share_obj)
-
-        sleep(2)
-
-    print("All A:", len(shares_financials))
-
-    shares_a = []
-
-    for share_fin in shares_financials:
-        last_net_income = share_fin["net_income"][-1]
-        first_net_income = share_fin["net_income"][0]
-
-        last_book_value = share_fin["book_value"][-1]
-        first_book_value = share_fin["book_value"][0]
-
-        if first_net_income > 0 and last_net_income > 0 and first_book_value > 0 and last_book_value > 0:
-            net_income_up = (((last_net_income / first_net_income) ** (1 / 4)) - 1) * 100
-            book_value_up = (((last_book_value / first_book_value) ** (1 / 4)) - 1) * 100
-            mean_roe = sum(share_fin["roe"]) / len(share_fin["roe"])
-
-            if net_income_up > 15 and book_value_up > 10 and mean_roe >= 15:
-                shares_a.append({
-                    "name": share_fin["name"],
-                    "ticker": share_fin["ticker"],
-                    "mean_income": net_income_up,
-                    "mead_book_value": book_value_up,
-                    "mean_roe": mean_roe
-                })
-
-    result_text = "Акции класса А:"
-
-    for share_a in shares_a:
-        result_text += f'\n\nИмя: {share_a["name"]}'
-        result_text += f'\nТикер: {share_a["ticker"]}'
-        result_text += f'\nРост прибыли: {"{:.2f}".format(share_a["mean_income"])}%'
-        result_text += f'\nРост собственного капитала: {"{:.2f}".format(share_a["mead_book_value"])}%'
-        result_text += f'\nСредняя рентабельность капитала: {"{:.2f}".format(share_a["mean_roe"])}%'
-
-    result_text += "\n\n *Пока не учитывается долг компаний. В ближайшем обновлении будет"
-
-    bot.send_message(user_id, result_text)
+    bot.send_message(user_id, text)
 
 # todo запоминание данных
 def get_companies_b(user_id):
@@ -376,7 +290,7 @@ def get_companies_b(user_id):
     bot.send_message(user_id, result_text)
 
 def share_get_fin(ticker, user_id):
-    start_text = "Получение списка компаний класса Б.\n\nПодождите, это займет несколько минут..."
+    start_text = f"Получение информации по тикеру {ticker}.\n\nПодождите, это займет несколько минут..."
     bot.send_message(user_id, start_text)
 
     url = 'https://smart-lab.ru/q/__TICKER__/f/y/'

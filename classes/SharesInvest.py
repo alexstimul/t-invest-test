@@ -1,14 +1,160 @@
 from datetime import datetime, timedelta
 import pytz
+import requests
+from bs4 import BeautifulSoup as bs
+from utils import utils
+from time import sleep
 
 from tinkoff.invest import Client, CandleInterval
 from tinkoff.invest.schemas import InstrumentExchangeType, GetAssetFundamentalsRequest, InstrumentIdType, CandleSource
 
 from classes.BaseInvest import BaseInvest
 from utils.utils import utc_to_moscow
+import constants.financial as fin
 
 
 class SharesInvest(BaseInvest):
+    def __init__(self):
+        super().__init__()
+        self.shares_financials = []
+
+        self.get_shares_financials()
+
+    def __get_smart_lab_data_content(self, ticker):
+        try:
+            request = requests.get(fin.SMART_LAB_URL.replace(fin.TICKER_PATTERN, ticker), headers=fin.SMART_LAB_REQUEST_HEADER)
+
+            if request.status_code == 200 and request.content:
+                return request.content
+
+            return None
+        except Exception as e:
+            print(f'Error when get smart lab data. {e}')
+            return None
+
+    def __parse_fin_response_for_classification(self, content, share_name, ticker):
+        share_obj = {"name": share_name, "ticker": ticker, "net_income": [], "book_value": [], "debt": [], "roe": []}
+
+        soup = bs(content, 'html.parser')
+        table = soup.find_all('table', {'class': 'simple-little-table financials'})
+
+        if not table or len(table) < 1:
+            return None
+
+        rows = table[0].find_all('tr')
+
+        for tr in rows:
+            field = tr.get("field")
+
+            if field == fin.PROFIT:  # чистая прибыль
+                tds = tr.find_all('td')
+                for td in tds:
+                    if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj[fin.PROFIT]) < 5:
+                        value = float(td.text.replace(" ", ""))
+                        share_obj[fin.PROFIT].append(value)
+            elif field == fin.CAPITAL:  # собственный капитал = балансная стоимость
+                tds = tr.find_all('td')
+                for td in tds:
+                    if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj[fin.CAPITAL]) < 5:
+                        value = float(td.text.replace(" ", ""))
+                        share_obj[fin.CAPITAL].append(value)
+            elif field == fin.ROE:
+                tds = tr.find_all('td')
+                for td in tds:
+                    if td.text and "%" in td.text and len(share_obj[fin.ROE]) <= 5:
+                        share_obj[fin.ROE].append(float(td.text.replace(" ", "").split("%")[0]))
+            elif field == fin.DEBT:  # долгосрочный долг
+                tds = tr.find_all('td')
+                for td in tds:
+                    if td.text and utils.is_number(td.text.replace(" ", "")) and len(share_obj[fin.DEBT]) < 5:
+                        value = float(td.text.replace(" ", ""))
+                        share_obj[fin.DEBT].append(value)
+
+        return share_obj
+
+    def get_shares_financials(self):
+        shares = self.get_shares()
+
+        for share in shares:
+            content = self.__get_smart_lab_data_content(share["ticker"])
+
+            if content:
+                share_financial = self.__parse_fin_response_for_classification(content, share["name"], share["ticker"])
+
+                if share_financial and len(share_financial[fin.CAPITAL]) == 5 and len(share_financial[fin.PROFIT]) == 5:
+                    self.shares_financials.append(share_financial)
+
+                sleep(2)
+
+        print(len(self.shares_financials))
+        print("Get shares financials end")
+
+    def __calculate_growth_indicators_by_share(self, share_fin):
+        last_net_income = share_fin[fin.PROFIT][-1]
+        first_net_income = share_fin[fin.PROFIT][0]
+
+        last_book_value = share_fin[fin.CAPITAL][-1]
+        first_book_value = share_fin[fin.CAPITAL][0]
+
+        if first_net_income > 0 and last_net_income > 0 and first_book_value > 0 and last_book_value > 0:
+            profit_growth = (((last_net_income / first_net_income) ** (1 / 4)) - 1) * 100
+            capital_growth = (((last_book_value / first_book_value) ** (1 / 4)) - 1) * 100
+            mean_roe = sum(share_fin[fin.ROE]) / len(share_fin[fin.ROE])
+
+            return profit_growth, capital_growth, mean_roe
+
+        return None, None, None
+
+    def get_shares_by_class_a(self):
+        shares_class_a = []
+
+        for share_fin in self.shares_financials:
+            profit, capital, roe = self.__calculate_growth_indicators_by_share(share_fin)
+
+            if (not profit is None) and (not capital is None) and (not roe is None):
+                if profit > 15 and capital > 10 and roe >= 15:
+                    shares_class_a.append({
+                        "name": share_fin["name"],
+                        "ticker": share_fin["ticker"],
+                        "profit": profit,
+                        "capital": capital,
+                        "mean_roe": roe
+                    })
+
+        return shares_class_a
+
+    def get_shares_by_class_b(self):
+        shares_class_b = []
+
+        for share_fin in self.shares_financials:
+            profit, capital, roe = self.__calculate_growth_indicators_by_share(share_fin)
+
+            if (not profit is None) and (not capital is None) and (not roe is None):
+                if (0 <= profit <= 20) and capital <= 15 and roe <= 15: # todo границы увеличины на 5, чтоб попадали пограничные акции
+                    shares_class_b.append({
+                        "name": share_fin["name"],
+                        "ticker": share_fin["ticker"],
+                        "profit": profit,
+                        "capital": capital,
+                        "mean_roe": roe
+                    })
+
+        return shares_class_b
+
+    def get_share_fin_classification_text(self, shares, class_type = "А"):
+        result_text = f'Акции класса {class_type}:'
+
+        for share in shares:
+            result_text += f'\n\nИмя: {share["name"]}'
+            result_text += f'\nТикер: {share["ticker"]}'
+            result_text += f'\nРост прибыли: {"{:.2f}".format(share["profit"])}%'
+            result_text += f'\nРост собственного капитала: {"{:.2f}".format(share["capital"])}%'
+            result_text += f'\nСредняя рентабельность капитала: {"{:.2f}".format(share["mean_roe"])}%'
+
+        result_text += "\n\n *Пока не учитывается долг компаний. В ближайшем обновлении будет"
+
+        return result_text
+
     def get_shares(self):
         with Client(self.token) as client:
             instruments = client.instruments
