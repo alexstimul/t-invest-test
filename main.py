@@ -255,16 +255,29 @@ def share_predict(input_ticker, user_id):
     bot.send_message(user_id, predict_text)
 
 def get_potential_price(input_ticker, user_id):
-    potential_price = shares_client.get_potential_share_price(input_ticker.upper())
+    potential_price_a, potential_price_b = shares_client.get_potential_share_price(input_ticker.upper())
 
-    text = "Акция не рекомендуется к покупке"
+    text = ''
 
-    if potential_price:
-        reasonable_price = shares_client.get_reasonable_share_price(potential_price, 1.3)
+    if potential_price_a:
+        reasonable_price_3 = shares_client.get_reasonable_share_price(potential_price_a, 1.3)
+        reasonable_price_5 = shares_client.get_reasonable_share_price(potential_price_a, 1.5)
 
-        if reasonable_price:
-            text = f'Потенциальная цена акции через 5 лет: {"{:.2f}".format(potential_price)} руб'
-            text += f'\nРекомендуемся к покупке цена акции: {"{:.2f}".format(reasonable_price)} руб'
+        if reasonable_price_3 and reasonable_price_5:
+            text = f'Потенциальная цена акции через 5 лет: {"{:.2f}".format(potential_price_a)} руб'
+            text += f'\nРекомендуемся к покупке цена акции со скидкой 30%: {"{:.2f}".format(reasonable_price_3)} руб'
+            text += f'\nРекомендуемся к покупке цена акции со скидкой 50%: {"{:.2f}".format(reasonable_price_5)} руб'
+
+    if potential_price_b:
+        enters = ''
+        if text != '':
+            enters = '\n\n'
+
+        text += f'{enters}Если компания класса Б, то'
+        text += f'\nРекомендуется покупать акцию, если отношение минимальной цены за акцию и EPS за текущий год находится в диапазоне или меньше {potential_price_b}'
+
+    if text == '':
+        text = 'Акция не рекомендуется к покупке'
 
     bot.send_message(user_id, text)
 
@@ -287,9 +300,3 @@ def get_text_messages(message):
 
 
 bot.polling(none_stop=True, interval=0)
-
-"""
-2 - 2440.65
-48.39
-
-"""

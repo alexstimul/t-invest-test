@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import re
+from itertools import count
 
 import pytz
 import requests
@@ -128,17 +129,25 @@ class SharesInvest(BaseInvest):
 
         return share_obj
 
+    def __get_share_financials_by_ticker(self, ticker=None, share = None):
+        content = self.__get_smart_lab_data_content(ticker if ticker else share['ticker'])
+
+        if content:
+            if share:
+                return self.__parse_fin_response_for_classification(content, share["name"], share["ticker"])
+            elif ticker:
+                return self.__parse_fin_response_for_classification(content, ticker, ticker)
+
+        return None
+
     def get_shares_financials(self):
         shares = self.get_shares()
 
         for share in shares:
-            content = self.__get_smart_lab_data_content(share["ticker"])
+            share_financial = self.__get_share_financials_by_ticker(share=share)
 
-            if content:
-                share_financial = self.__parse_fin_response_for_classification(content, share["name"], share["ticker"])
-
-                if share_financial and len(share_financial[fin.CAPITAL]) == 5 and len(share_financial[fin.PROFIT]) == 5:
-                    self.shares_financials.append(share_financial)
+            if share_financial and len(share_financial[fin.CAPITAL]) == 5 and len(share_financial[fin.PROFIT]) == 5:
+                self.shares_financials.append(share_financial)
 
                 sleep(2)
 
@@ -227,6 +236,18 @@ class SharesInvest(BaseInvest):
 
         return result_text
 
+    def __get_profit_avg_growth(self, share_fin):
+        last_profit = share_fin[fin.PROFIT][-1]
+        first_profit = share_fin[fin.PROFIT][0]
+
+        return (((last_profit / first_profit) ** (1 / 4)) - 1) * 100
+
+    def __get_capital_avg_growth(self, share_fin):
+        last_capital = share_fin[fin.CAPITAL][-1]
+        first_capital = share_fin[fin.CAPITAL][0]
+
+        return (((last_capital / first_capital) ** (1 / 4)) - 1) * 100
+
     def __get_eps_growth(self, share_fin):
         last_eps = share_fin[fin.EPS][-1]
         first_eps = share_fin[fin.EPS][0]
@@ -268,23 +289,111 @@ class SharesInvest(BaseInvest):
 
         return sum_pe / count_pe
 
-    def get_potential_share_price(self, ticker):
-        print(ticker)
-        print(len(self.shares_financials))
-        for share_fin in self.shares_financials:
-            if ticker == share_fin["ticker"]:
-                print(share_fin)
-            if ticker == share_fin["ticker"] and len(share_fin[fin.EPS]) == 5 and len(share_fin[fin.P_E]) == 5:
-                growth = self.__get_eps_growth(share_fin)
-                conservative_rate = self.__get_conservative_percent_growth(growth)
-                avg_pe = self.__avg_p_e(share_fin)
-                last_eps = share_fin[fin.EPS][-1]
+    def __get_avg_pbv(self, share_fin):
+        return sum(share_fin[fin.P_BV]) / len(share_fin[fin.P_BV])
 
-                print(growth, conservative_rate, avg_pe, last_eps)
+    def __parse_shares_count(self, content):
+        soup = bs(content, 'html.parser')
+        main_div = soup.find_all('div', {'id': 'rightside-col'})
 
-                return (last_eps * (conservative_rate ** 4)) * avg_pe
+        if not main_div or len(main_div) < 1:
+            return None
+
+        numbers = main_div[0].find_all('strong')
+        if len(numbers) > 1:
+            print(numbers[1].text)
+            return float(numbers[1].text.split(" ")[0]) * 1_000_000
+
+    def __get_shares_count(self, ticker):
+        content = self.__get_dohod_data_content(ticker)
+        if content:
+            return self.__parse_shares_count(content)
 
         return None
+
+    def __calc_potential_price_class_a(self, share_fin):
+        profit_growth = self.__get_profit_avg_growth(share_fin)
+        capital_growth = self.__get_capital_avg_growth(share_fin)
+
+        if profit_growth >= 15 > capital_growth:
+            growth = self.__get_eps_growth(share_fin)
+            conservative_rate = self.__get_conservative_percent_growth(growth)
+            avg_pe = self.__avg_p_e(share_fin)
+            last_eps = share_fin[fin.EPS][-1]
+
+            return (last_eps * (conservative_rate ** 4)) * avg_pe
+        else:
+            last_capital = share_fin[fin.CAPITAL][-1]
+            last_capital_growth = last_capital * (1.2 ** 4)
+            avg_pbv = self.__get_avg_pbv(share_fin)
+            shares_count = self.__get_shares_count(share_fin['ticker'].lower())
+
+            if shares_count and avg_pbv:
+                potential_price = last_capital_growth * 1_000_000_000 / shares_count
+                potential_price *= avg_pbv
+
+                conservative_growth = self.__get_conservative_percent_growth(capital_growth)
+
+                if conservative_growth > 0:
+                    return potential_price / (conservative_growth ** 4)
+
+        return None
+
+
+    def __calc_potential_price_class_b(self, share_fin):
+        profit_growth = self.__get_profit_avg_growth(share_fin)
+        capital_growth = self.__get_capital_avg_growth(share_fin)
+        avg_roe = sum(share_fin[fin.ROE]) / len(share_fin[fin.ROE])
+
+        if profit_growth < 15 and capital_growth < 15 and avg_roe < 15:
+            avg_pe = self.__avg_p_e(share_fin)
+
+            return f'{avg_pe * 0.5} - {avg_pe * 0.7}'
+
+        return None
+
+    def get_potential_share_price(self, ticker):
+        print(ticker)
+
+        is_share_exist = False
+
+        for share_fin in self.shares_financials:
+            if ticker == share_fin["ticker"]:
+                is_share_exist = True
+
+                if len(share_fin[fin.EPS]) == 5 and len(share_fin[fin.P_E]) == 5:
+                    shares_class_a = self.get_shares_by_class_a()
+                    shares_class_b = self.get_shares_by_class_b()
+
+                    for class_a in shares_class_a:
+                        if share_fin['ticker'] == class_a['ticker']:
+                            return self.__calc_potential_price_class_a(share_fin), None
+
+                    for class_b in shares_class_b:
+                        if share_fin['ticker'] == class_b['ticker']:
+                            return None, self.__calc_potential_price_class_b(share_fin)
+
+                    return self.__calc_potential_price_class_a(share_fin), self.__calc_potential_price_class_b(share_fin)
+
+        if not is_share_exist:
+            share_financial = self.__get_share_financials_by_ticker(ticker=ticker)
+
+            if share_financial and len(share_financial[fin.CAPITAL]) == 5 and len(share_financial[fin.PROFIT]) == 5:
+                if len(share_financial[fin.EPS]) == 5 and len(share_financial[fin.P_E]) == 5:
+                    shares_class_a = self.get_shares_by_class_a()
+                    shares_class_b = self.get_shares_by_class_b()
+
+                    for class_a in shares_class_a:
+                        if share_financial['ticker'] == class_a['ticker']:
+                            return self.__calc_potential_price_class_a(share_financial), None
+
+                    for class_b in shares_class_b:
+                        if share_financial['ticker'] == class_b['ticker']:
+                            return None, self.__calc_potential_price_class_b(share_financial)
+
+                    return self.__calc_potential_price_class_a(share_financial), self.__calc_potential_price_class_b(share_financial)
+
+        return None, None
 
     def get_reasonable_share_price(self, potential_price, rate):
         return potential_price / (rate ** 4)
