@@ -452,14 +452,13 @@ class SharesInvest(BaseInvest):
         CANDLE_INTERVAL_MONTH = 13
     """
 
-    def get_candle_by_year(self, instrument_id, interval, days=1):
+    def get_candle_by_interval(self, instrument_id, interval, days=1):
         # ключ - дата, значение - массив свечей
         candles = {}
         with Client(self.token) as client:
             for candle in client.get_all_candles(
                     instrument_id=instrument_id,
                     from_=datetime.now().replace(hour=0, minute=0, second=0, tzinfo=pytz.utc) - timedelta(days=days),
-                    # todo return 365, 3 for tests
                     interval=interval,
                     candle_source_type=CandleSource.CANDLE_SOURCE_UNSPECIFIED,
             ):

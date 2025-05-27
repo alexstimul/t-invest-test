@@ -1,0 +1,10 @@
+# Folders
+.hypothesis
+.idea
+venv
+__pycache__/
+
+# Files
+api_token.txt
+tg_token.txt
+*.xlsx*
